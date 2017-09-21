@@ -4,7 +4,10 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
+#include <map>
+#include <memory>
 #include <unordered_set>
 #include <vector>
 
@@ -15,6 +18,8 @@
 #include <sysexits.h>
 #include <unistd.h>
 
+#include <ca-cas/cas-columnfile.h>
+#include <ca-cas/client.h>
 #include <columnfile.h>
 #include <kj/debug.h>
 
@@ -22,23 +27,78 @@ namespace {
 
 int print_version = 0;
 int print_help = 0;
+cantera::ColumnFileCompression compression =
+    cantera::kColumnFileCompressionDefault;
 std::string format;
 std::string output_format;
 std::vector<std::pair<uint32_t, std::string>> filters;
 
 enum Option {
+  kOptionCompression = 'c',
   kOptionFilter = 'F',
   kOptionFormat = 'f',
   kOptionOutputFormat = 'o'
 };
 
+const std::string kCasTableUrnPrefix = "urn:ca-cas-table:";
+
+const size_t kFlushLimit(16 << 20);  // 16 MiB
+
 struct option kLongOptions[] = {
+    {"compression", required_argument, nullptr, kOptionCompression},
     {"filter", required_argument, nullptr, kOptionFilter},
     {"format", required_argument, nullptr, kOptionFormat},
     {"output-format", required_argument, nullptr, kOptionOutputFormat},
     {"version", no_argument, &print_version, 1},
     {"help", no_argument, &print_help, 1},
     {nullptr, 0, nullptr, 0}};
+
+const std::map<std::string, cantera::ColumnFileCompression> kCompressionMethods{
+    {
+        {"none", cantera::kColumnFileCompressionNone},
+        {"snappy", cantera::kColumnFileCompressionSnappy},
+        {"lz4", cantera::kColumnFileCompressionLZ4},
+        {"lzma", cantera::kColumnFileCompressionLZMA},
+        {"deflate", cantera::kColumnFileCompressionZLIB},
+    }};
+
+class StreambufWrapper : public std::streambuf {
+ public:
+  StreambufWrapper(std::streambuf& output) : output_{output} {}
+
+ protected:
+  void imbue(const std::locale& loc) final { output_.pubimbue(loc); }
+
+  std::streambuf* setbuf(char_type* s, std::streamsize n) final {
+    return output_.pubsetbuf(s, n);
+  }
+
+  pos_type seekoff(off_type off, std::ios_base::seekdir way,
+                   std::ios_base::openmode which) final {
+    return output_.pubseekoff(off, way, which);
+  }
+
+  pos_type seekpos(pos_type pos, std::ios_base::openmode which) final {
+    return output_.pubseekpos(pos, which);
+  }
+
+  int sync() final { return output_.pubsync(); }
+
+  int_type underflow() final { return output_.sgetc(); }
+
+  std::streamsize xsgetn(char_type* s, std::streamsize n) final {
+    return output_.sgetn(s, n);
+  }
+
+  std::streamsize xsputn(const char_type* s, std::streamsize n) final {
+    return output_.sputn(s, n);
+  }
+
+  int_type overflow(int_type ch) final { return output_.sputc(ch); }
+
+ private:
+  std::streambuf& output_;
+};
 
 }  // namespace
 
@@ -50,6 +110,14 @@ int main(int argc, char** argv) {
       errx(EX_USAGE, "Try '%s --help' for more information.", argv[0]);
 
     switch (static_cast<Option>(i)) {
+      case kOptionCompression:
+        try {
+          compression = kCompressionMethods.at(optarg);
+        } catch (std::out_of_range&) {
+          errx(EX_USAGE, "Unknown compression algorithm '%s'", optarg);
+        }
+        break;
+
       case kOptionFilter: {
         auto delimiter = strchr(optarg, ':');
         KJ_REQUIRE(delimiter != nullptr, optarg);
@@ -71,13 +139,19 @@ int main(int argc, char** argv) {
     printf(
         "Usage: %s [OPTION]... [FILE]...\n"
         "\n"
+        "      --compression=METHOD   select output compression method\n"
         "      --format=FORMAT        column formats\n"
         "      --filter=COL:PATTERN   only show rows whose COLUMN matches "
         "PATTERN\n"
+        "      --output-format=TYPE   select output data format\n"
         "      --help     display this help and exit\n"
         "      --version  display version information and exit\n"
         "\n"
         "With no FILE, or when FILE is -, read standard input.\n"
+        "\n"
+        "Data formats supported by the --output-format option:\n"
+        "    text        Tab delimited values\n"
+        "    columnfile  Column file (e.g. for recompression)\n"
         "\n"
         "Report bugs to <morten.hustveit@gmail.com>\n",
         argv[0]);
@@ -91,16 +165,35 @@ int main(int argc, char** argv) {
     return EXIT_SUCCESS;
   }
 
-  std::vector<kj::AutoCloseFd> inputs;
+  auto aio_context = kj::setupAsyncIo();
+  std::unique_ptr<cantera::CASClient> cas_client;
+
+  std::vector<std::unique_ptr<cantera::ColumnFileInput>> inputs;
 
   if (optind == argc) {
-    inputs.emplace_back(STDIN_FILENO);
+    inputs.emplace_back(cantera::ColumnFileReader::StreambufInput(
+        std::make_unique<StreambufWrapper>(*std::cin.rdbuf())));
   } else {
     for (auto i = optind; i < argc; ++i) {
-      if (!strcmp(argv[i], "-"))
-        inputs.emplace_back(STDIN_FILENO);
-      else
-        inputs.emplace_back(kj::AutoCloseFd{open(argv[i], O_RDONLY)});
+      std::string path{argv[i]};
+      if (path == "-") {
+        inputs.emplace_back(cantera::ColumnFileReader::StreambufInput(
+            std::make_unique<StreambufWrapper>(*std::cin.rdbuf())));
+      } else if (0 == path.compare(0, kCasTableUrnPrefix.size(),
+                                   kCasTableUrnPrefix)) {
+        if (!cas_client)
+          cas_client = std::make_unique<cantera::CASClient>(aio_context);
+
+        inputs.emplace_back(std::make_unique<cantera::CASColumnFileInput>(
+            cas_client.get(), path.substr(kCasTableUrnPrefix.size())));
+      } else {
+        auto filebuf = std::make_unique<std::filebuf>();
+        KJ_REQUIRE(nullptr != filebuf->open(argv[i], std::ios_base::binary |
+                                                         std::ios_base::in),
+                   argv[i]);
+        inputs.emplace_back(
+            cantera::ColumnFileReader::StreambufInput(std::move(filebuf)));
+      }
     }
   }
 
@@ -169,15 +262,15 @@ int main(int argc, char** argv) {
           if (need_tab) std::cout << '\t';
 
           switch (fmt) {
-#define FMT(ch, type) \
-            case ch: { \
-              KJ_REQUIRE(field.second.value().size() >= sizeof(type), \
-                         field.second.value().size()); \
-              type f; \
-              memcpy(&f, field.second.value().data(), sizeof(f)); \
-              std::cout << f; \
-              need_tab = true; \
-            } break;
+#define FMT(ch, type)                                       \
+  case ch: {                                                \
+    KJ_REQUIRE(field.second.value().size() >= sizeof(type), \
+               field.second.value().size(), fmt);           \
+    type f;                                                 \
+    memcpy(&f, field.second.value().data(), sizeof(f));     \
+    std::cout << f;                                         \
+    need_tab = true;                                        \
+  } break;
 
             // Based on Python's "struct" module format characters.
             FMT('H', uint16_t)
@@ -188,6 +281,8 @@ int main(int argc, char** argv) {
             FMT('h', int16_t)
             FMT('i', int32_t)
             FMT('q', int64_t)
+
+#undef FMT
 
             case 's':
               std::cout << field.second.value();
@@ -202,8 +297,9 @@ int main(int argc, char** argv) {
       }
     }
   } else if (output_format == "columnfile") {
-    cantera::ColumnFileWriter output(kj::AutoCloseFd(STDOUT_FILENO));
-    size_t next_flush = 10000;
+    cantera::ColumnFileWriter output(
+        std::make_unique<StreambufWrapper>(*std::cout.rdbuf()));
+    output.SetCompression(compression);
 
     for (auto& input : inputs) {
       cantera::ColumnFileReader reader(std::move(input));
@@ -211,12 +307,31 @@ int main(int argc, char** argv) {
       while (!reader.End()) {
         output.PutRow(reader.GetRow());
 
-        if (!--next_flush) {
-          output.Flush();
-          next_flush = 10000;
-        }
+        if (output.PendingSize() > kFlushLimit) output.Flush();
       }
     }
+  } else if (output_format == "cas-columnfile") {
+    if (!cas_client)
+      cas_client = std::make_unique<cantera::CASClient>(aio_context);
+    auto cas_output =
+        std::make_shared<cantera::CASColumnFileOutput>(cas_client.get());
+
+    cantera::ColumnFileWriter output{cas_output};
+    output.SetCompression(compression);
+
+    for (auto& input : inputs) {
+      cantera::ColumnFileReader reader(std::move(input));
+
+      while (!reader.End()) {
+        output.PutRow(reader.GetRow());
+
+        if (output.PendingSize() > kFlushLimit) output.Flush();
+      }
+    }
+
+    output.Finalize();
+
+    std::cout << kCasTableUrnPrefix << cas_output->Key() << '\n';
   } else {
     KJ_FAIL_REQUIRE("Unknown output format", output_format);
   }

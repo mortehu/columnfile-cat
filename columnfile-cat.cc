@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -297,6 +298,14 @@ int main(int argc, char** argv) {
 
             case 's':
               std::cout << field.second.value();
+              need_tab = true;
+              break;
+
+            case 'x':
+              std::cout << std::hex << std::setfill('0');
+              for (const auto ch : field.second.value())
+                std::cout << std::setw(2) << static_cast<int>(static_cast<uint8_t>(ch));
+              std::cout << std::dec;
               need_tab = true;
               break;
           }
